@@ -185,436 +185,179 @@ def defaultPD(agent, local_target, upside_down=False, up=None):
     return target_angles
 
 
-# =============================================================================
-# ADVANCED AERIAL CONTROLLER - OPTIMAL CONTROL BASED
-# =============================================================================
-# Combines:
-# 1. CasADI-inspired direct collocation for optimal trajectory planning
-# 2. NTUD-style 1D kinematic controller for minimum-time interception
-# 3. Nose-targeting for precise ball contact
-# =============================================================================
-
-GRAVITY = 650.0
-BOOST_ACCEL = 991.666
-THROTTLE_ACCEL = 66.666
-JUMP_SPEED = 291.666
-JUMP_ACCEL = 1458.333
-JUMP_MAX_DURATION = 0.2
-MASS = 180.0
-
-# Car physics constants
-MAX_CAR_SPEED = 2300.0
-AERIAL_DRAG = 0.03
-
-def solve_1d_minimum_time(pos0, vel0, target_pos, target_vel, max_accel, gravity=0.0):
-    """
-    NTUD-style 1D kinematic minimum-time solver.
-    Solves: min T s.t. pos(T) = target_pos, vel(T) = target_vel
-    with |accel| <= max_accel, using bang-bang control.
-    Returns (time, accel_profile) or (inf, None) if unreachable.
-    """
-    # Simplified: assume we can reach target_vel = 0 at intercept
-    # For aerial, we solve the double integrator with gravity compensation
-    
-    delta_pos = target_pos - pos0
-    delta_vel = target_vel - vel0
-    
-    # With gravity compensation, effective acceleration is max_accel - gravity
-    # (gravity acts against upward motion)
-    a_max = max_accel
-    a_min = -max_accel  # can always thrust downward
-    
-    # Time-optimal 1D trajectory with bounded acceleration (bang-bang)
-    # We need to find switching times for acceleration profile
-    
-    # For minimum time to reach position with zero final velocity:
-    # Use the classical time-optimal control solution
-    # v^2 = v0^2 + 2*a*(x - x0)
-    
-    # If we accelerate at a_max then decelerate at a_min:
-    # Distance during accel: d1 = (v_peak^2 - v0^2) / (2*a_max)
-    # Distance during decel: d2 = (0 - v_peak^2) / (2*a_min) = v_peak^2 / (2*|a_min|)
-    # Total: d = d1 + d2 = (v_peak^2 - v0^2)/(2*a_max) + v_peak^2/(2*|a_min|)
-    # If a_max = |a_min| = a: d = v_peak^2/a - v0^2/(2a)
-    # So v_peak^2 = a*d + v0^2/2
-    # Time = (v_peak - v0)/a + v_peak/a = (2*v_peak - v0)/a
-    
-    a = a_max
-    required_disp = delta_pos
-    
-    # Check if we can do it with pure acceleration (no coast)
-    # v_peak^2 = v0^2 + 2*a*d1, and v_peak^2 = 2*a*d2 (decel to 0)
-    # So d1 = (v_peak^2 - v0^2)/(2a), d2 = v_peak^2/(2a)
-    # d = d1 + d2 = v_peak^2/a - v0^2/(2a)
-    # v_peak^2 = a*d + v0^2/2
-    
-    v_peak_sq = a * abs(required_disp) + vel0**2 / 2
-    if v_peak_sq < 0:
-        return float('inf'), None
-    
-    v_peak = math.sqrt(v_peak_sq)
-    t_accel = (v_peak - vel0) / a if required_disp >= 0 else (v_peak + vel0) / a
-    t_decel = v_peak / a
-    
-    if t_accel < 0:
-        # Need to decelerate first
-        t_accel = 0
-        v_peak = abs(vel0)
-        t_decel = v_peak / a
-        # Check if we can reach target
-        d_decel = vel0**2 / (2*a)
-        if abs(required_disp) > d_decel:
-            return float('inf'), None
-    
-    return t_accel + t_decel, (t_accel, t_decel, v_peak)
-
-
-def direct_collocation_trajectory(car_pos, car_vel, car_up, ball_pos, ball_vel, intercept_time, dt=1/120.0):
-    """
-    CasADI-inspired direct collocation for optimal aerial trajectory.
-    Discretizes time into N steps, optimizes control inputs (thrust direction, boost)
-    to minimize: ||pos_N - ball_pos||^2 + w * ||vel_N||^2
-    subject to: car dynamics, control bounds.
-    
-    This is a simplified implementation using iterative LQR / shooting method
-    since we can't use CasADI directly in RLBot.
-    """
-    N = int(intercept_time / dt)
-    if N < 2:
-        N = 2
-    if N > 120:
-        N = 120
-        dt = intercept_time / N
-    
-    gravity_vec = Vector(0, 0, -GRAVITY)
-    
-    # Initialize with simple ballistic + thrust toward target
-    states = []
-    controls = []
-    
-    pos = Vector(car_pos.x, car_pos.y, car_pos.z)
-    vel = Vector(car_vel.x, car_vel.y, car_vel.z)
-    
-    # Forward pass: generate nominal trajectory
-    for i in range(N):
-        t = i * dt
-        # Predict ball position at this time
-        ball_pred = ball_pos + ball_vel * t
-        
-        # Direction to ball
-        to_ball = (ball_pred - pos).normalize()
-        
-        # Control: thrust toward ball with boost when aligned
-        thrust_dir = to_ball
-        use_boost = vel.dot(thrust_dir) > 500
-        
-        accel = thrust_dir * (BOOST_ACCEL if use_boost else THROTTLE_ACCEL)
-        accel += gravity_vec
-        
-        states.append((pos, vel))
-        controls.append((thrust_dir, use_boost))
-        
-        vel = vel + accel * dt
-        pos = pos + vel * dt
-    
-    # Backward pass: refine using gradient descent on final error
-    final_error = pos - (ball_pos + ball_vel * intercept_time)
-    
-    # Simple correction: adjust initial thrust direction
-    # This is a simplified shooting method
-    for iteration in range(3):
-        # Re-simulate with corrected initial aim
-        correction = -final_error * 0.3 / N
-        
-        pos = Vector(car_pos.x, car_pos.y, car_pos.z)
-        vel = Vector(car_vel.x, car_vel.y, car_vel.z)
-        
-        for i in range(N):
-            t = i * dt
-            ball_pred = ball_pos + ball_vel * t
-            to_ball = (ball_pred - pos).normalize()
-            
-            # Apply correction mostly early in trajectory
-            if i < N // 3:
-                thrust_dir = (to_ball + correction).normalize()
-            else:
-                thrust_dir = to_ball
-            
-            use_boost = vel.dot(thrust_dir) > 500 and i < N * 0.7
-            accel = thrust_dir * (BOOST_ACCEL if use_boost else THROTTLE_ACCEL) + gravity_vec
-            
-            vel = vel + accel * dt
-            pos = pos + vel * dt
-        
-        final_error = pos - (ball_pos + ball_vel * intercept_time)
-        if final_error.magnitude() < 50:
-            break
-    
-    # Return the first control action
-    if controls:
-        return controls[0][0], controls[0][1], states
-    return Vector(0, 0, 1), False, []
-
-
 class Maneuver_Aerial:
-    """
-    Advanced aerial controller using optimal control theory.
-    
-    Key improvements over previous version:
-    - NTUD 1D kinematic solver for minimum-time intercept feasibility
-    - CasADI-inspired direct collocation for optimal trajectory
-    - Nose-targeting: aligns car's forward vector with required acceleration
-    - Adaptive intercept time selection using reachability analysis
-    - Explicit boost management for time-optimal trajectories
-    """
     def __init__(self, agent, intercept_time, shot_target):
         self.intercept_time = intercept_time
         self.shot_target = shot_target
         self.ball_location = None
         self.ball_velocity = None
-        
-        # Physics constants
-        self.jump_speed = JUMP_SPEED
-        self.jump_acc = JUMP_ACCEL
-        self.jump_max_duration = JUMP_MAX_DURATION
-        self.boost_accel = BOOST_ACCEL
-        self.throttle_accel = THROTTLE_ACCEL
-        
-        # State
+
+        self.jump_speed = 291 + (2 / 3)
+        self.jump_acc = 1458 + (1 / 3)
+        self.jump_max_duration = 0.2
+        self.boost_accel = 991 + (2 / 3)
+        self.min_boost_time = 1 / 30
+        self.throttle_accel = 66 + (2 / 3)
+
         self.jumping = True
         self.jump_time = agent.time
+        # The jump impulse must be applied on the FIRST frame this maneuver is
+        # executed (which is one tick after construction, so `jump_elapsed`
+        # is already > 0). A `_jump_impulse_applied` flag guarantees it is
+        # applied exactly once regardless of frame timing.
         self._jump_impulse_applied = False
-        self._trajectory_plan = None
-        self._plan_valid_until = 0.0
-        self._last_intercept_time = intercept_time
-        
-        # Nose targeting
-        self._target_nose_dir = None
-        self._align_phase = False
-
-    def _compute_optimal_intercept(self, agent, prediction, current_T):
-        """
-        Find the optimal intercept point using reachability analysis.
-        Uses NTUD-style 1D kinematic checks in each axis.
-        """
-        current_slice_index = math.ceil(current_T * 120)
-        NARROW_WINDOW = 60
-        WIDE_WINDOW = 180
-        
-        gravity = Vector(0, 0, -GRAVITY)
-        
-        def check_reachability(slice_idx, dt):
-            """Check if car can reach ball at this slice using 1D kinematics."""
-            s = prediction.slices[slice_idx]
-            ball_pos = Vector(s.physics.location.x, s.physics.location.y, s.physics.location.z)
-            ball_vel = Vector(s.physics.velocity.x, s.physics.velocity.y, s.physics.velocity.z)
-            
-            # Car predicted position without control
-            car_pos = agent.me.location + agent.me.velocity * dt + gravity * 0.5 * dt * dt
-            car_vel = agent.me.velocity + gravity * dt
-            
-            # Check each axis independently (NTUD approach)
-            # X-axis
-            tx, _ = solve_1d_minimum_time(car_pos.x, car_vel.x, ball_pos.x, ball_vel.x, self.boost_accel)
-            # Y-axis  
-            ty, _ = solve_1d_minimum_time(car_pos.y, car_vel.y, ball_pos.y, ball_vel.y, self.boost_accel)
-            # Z-axis (with gravity)
-            tz, _ = solve_1d_minimum_time(car_pos.z, car_vel.z, ball_pos.z, ball_vel.z, self.boost_accel, GRAVITY)
-            
-            # Overall time is max of axes (coupled through thrust direction)
-            t_min = max(tx, ty, tz)
-            
-            # Account for turning time
-            to_ball = (ball_pos - car_pos).normalize()
-            turn_angle = agent.me.forward.angle(to_ball)
-            turn_time = turn_angle * 0.35  # empirical
-            
-            return t_min + turn_time <= dt + 0.1, ball_pos, ball_vel, t_min
-        
-        def find_best(window):
-            start = clamp(current_slice_index - window, 0, len(prediction.slices) - 1)
-            end = clamp(current_slice_index + window, 0, len(prediction.slices) - 1)
-            best = None
-            best_score = float('inf')
-            
-            for i in range(start, end + 1):
-                s = prediction.slices[i]
-                dt = s.game_seconds - agent.time
-                if dt <= 0.05:
-                    continue
-                
-                reachable, ball_pos, ball_vel, t_min = check_reachability(i, dt)
-                if not reachable:
-                    continue
-                
-                # Score: prefer earlier intercepts, penalize high altitude
-                ball_pos = Vector(s.physics.location.x, s.physics.location.y, s.physics.location.z)
-                altitude_penalty = max(0, (ball_pos.z - 500) / 1000.0)
-                score = dt + altitude_penalty * 0.5
-                
-                if score < best_score:
-                    best_score = score
-                    best = (s.game_seconds, ball_pos, ball_vel, t_min)
-            
-            return best
-        
-        result = find_best(NARROW_WINDOW)
-        if result is None:
-            result = find_best(WIDE_WINDOW)
-        
-        return result
-
-    def _plan_trajectory(self, agent, packet):
-        """
-        Plan optimal trajectory using direct collocation (CasADI-inspired).
-        Called periodically or when intercept target changes significantly.
-        """
-        if self.ball_location is None:
-            return None
-        
-        T = self.intercept_time - agent.time
-        if T <= 0.1:
-            return None
-        
-        # Check if we need to replan
-        if self._trajectory_plan is not None and agent.time < self._plan_valid_until:
-            if abs(self.intercept_time - self._last_intercept_time) < 0.1:
-                return self._trajectory_plan
-        
-        # Plan using direct collocation
-        thrust_dir, use_boost, states = direct_collocation_trajectory(
-            agent.me.location, agent.me.velocity, agent.me.up,
-            self.ball_location, self.ball_velocity, T
-        )
-        
-        self._trajectory_plan = (thrust_dir, use_boost, states)
-        self._plan_valid_until = agent.time + 0.1
-        self._last_intercept_time = self.intercept_time
-        
-        # Compute nose targeting direction
-        # The nose should point along the required acceleration vector
-        gravity = Vector(0, 0, -GRAVITY)
-        required_accel = thrust_dir * (BOOST_ACCEL if use_boost else THROTTLE_ACCEL)
-        total_accel = required_accel + gravity
-        
-        # Nose should align with total acceleration for optimal control
-        if total_accel.magnitude() > 10:
-            self._target_nose_dir = total_accel.normalize()
-        else:
-            self._target_nose_dir = thrust_dir
-        
-        return self._trajectory_plan
 
     def __call__(self, agent, packet):
         prediction = agent.get_ball_prediction()
         if prediction is None or len(prediction.slices) == 0:
             agent.maneuver_lock = 0
             return
-        
+
         current_T = self.intercept_time - agent.time
-        
-        # Re-evaluate intercept point every frame using optimal control
-        intercept_result = self._compute_optimal_intercept(agent, prediction, current_T)
-        
-        if intercept_result is not None:
-            best_time, best_ball_loc, best_ball_vel, t_min = intercept_result
+        current_slice_index = math.ceil(current_T * 120)
+
+        gravity = Vector(0, 0, packet.match_info.world_gravity_z)
+
+        # Search window around the current intercept time.
+        # ±60 slices (~0.5s) primary, ±180 (~1.5s) fallback re-acquisition.
+        NARROW_WINDOW = 60
+        WIDE_WINDOW   = 180
+
+        def find_best_intercept(window):
+            start = clamp(current_slice_index - window, 0, len(prediction.slices) - 1)
+            end   = clamp(current_slice_index + window, 0, len(prediction.slices) - 1)
+            best_t, best_loc, best_vel, best_d2 = self.intercept_time, None, None, float('inf')
+            for i in range(start, end + 1):
+                s = prediction.slices[i]
+                dt = s.game_seconds - agent.time
+                if dt <= 0.05:
+                    continue
+                car_pred = (agent.me.location
+                            + agent.me.velocity * dt
+                            + gravity * 0.5 * dt * dt)
+                ball_pred = Vector(s.physics.location.x, s.physics.location.y, s.physics.location.z)
+                d2 = car_pred.dist_sq(ball_pred)
+                if d2 < best_d2:
+                    best_d2, best_t, best_loc, best_vel = d2, s.game_seconds, ball_pred, Vector(s.physics.velocity.x, s.physics.velocity.y, s.physics.velocity.z)
+            return best_t, best_loc, best_vel, best_d2
+
+        best_time, best_ball_loc, best_ball_vel, closest_dist_sq = find_best_intercept(NARROW_WINDOW)
+        found_viable_slice = best_ball_loc is not None
+
+        # Wider re-acquisition pass if narrow search gives a poor result.
+        RE_ACQUIRE_THRESHOLD_SQ = 250000  # 500 uu radius
+        if closest_dist_sq > RE_ACQUIRE_THRESHOLD_SQ:
+            wide_time, wide_loc, wide_vel, wide_d2 = find_best_intercept(WIDE_WINDOW)
+            if wide_loc is not None and wide_d2 < closest_dist_sq:
+                best_time, best_ball_loc, best_ball_vel, closest_dist_sq = wide_time, wide_loc, wide_vel, wide_d2
+                found_viable_slice = True
+
+        if found_viable_slice:
             self.ball_location = best_ball_loc
             self.ball_velocity = best_ball_vel
             self.intercept_time = best_time
-            current_T = best_time - agent.time
+
+        # Abort if we are less than 1 s from intercept but still >400 uu away
+        # and could not find a better slice anywhere in the wide window.
+        if closest_dist_sq > 160000 and current_T < 1.0:  # 400^2
+            agent.maneuver_lock = 0
+            return
         
-        # Abort conditions
+        # No usable intercept slice was found in either search window — abort
+        # cleanly instead of dereferencing the (still None) ball_location.
         if self.ball_location is None:
             agent.maneuver_lock = 0
             return
         
-        if current_T < 0.05:
-            agent.maneuver_lock = 0
-            return
-        
-        # Plan trajectory
-        plan = self._plan_trajectory(agent, packet)
-        if plan is None:
-            agent.maneuver_lock = 0
-            return
-        
-        thrust_dir, use_boost, states = plan
+        shot_vector = (self.shot_target - self.ball_location).normalize()
         
         T = self.intercept_time - agent.time
-        gravity = Vector(0, 0, -GRAVITY)
         
-        # Jump phase management
+        xf = agent.me.location + agent.me.velocity * T + gravity * 0.5 * T * T
+        vf = agent.me.velocity + gravity * T
+        
+        ball_radius_offset = 90.0
+        # Lead the target slightly based on ball velocity to improve contact on moving balls.
+        # The ball moves during the ~0.016s frame interval around intercept; scale by a small factor.
+        lead_time = 0.02
+        if self.ball_velocity is not None:
+            lead_offset = self.ball_velocity * lead_time
+            # Only lead perpendicular to shot direction; forward/backward is handled by radius offset.
+            lead_parallel = lead_offset.dot(shot_vector) * shot_vector
+            lead_perp = lead_offset - lead_parallel
+            target = self.ball_location - shot_vector * ball_radius_offset + lead_perp
+        else:
+            target = self.ball_location - shot_vector * ball_radius_offset
+        
+        agent.renderer_target = target
+
         jump_elapsed = agent.time - self.jump_time
-        
+
         if self.jumping:
             tau = self.jump_max_duration - jump_elapsed
-            
+            # Apply the initial jump impulse exactly once, on the first executed frame
+            # (jump_elapsed is already > 0 here since the maneuver runs one tick after
+            # construction, so the old `jump_elapsed == 0` branch never fired).
             if not self._jump_impulse_applied:
+                vf += agent.me.up * self.jump_speed
+                xf += agent.me.up * self.jump_speed * T
                 self._jump_impulse_applied = True
-            
+
+            vf += agent.me.up * self.jump_acc * tau
+            xf += agent.me.up * self.jump_acc * tau * (T - 0.5 * tau)
+
             if jump_elapsed <= self.jump_max_duration:
                 agent.controller_state.jump = True
             else:
                 self.jumping = False
-                self._align_phase = True  # Start nose alignment after jump
-        
-        # Target for rendering
-        shot_vector = (self.shot_target - self.ball_location).normalize()
-        ball_radius_offset = 90.0
-        target = self.ball_location - shot_vector * ball_radius_offset
-        agent.renderer_target = target
-        
-        # Get car's predicted state at intercept (ballistic)
-        xf = agent.me.location + agent.me.velocity * T + gravity * 0.5 * T * T
-        
-        # Vector from predicted car pos to target
+
         delta_x = target - xf
-        
-        # NOSE TARGETING: Instead of aiming at target, aim the nose along required acceleration
-        if self._target_nose_dir is not None and self._align_phase:
-            # Aim point is car position + nose direction (makes nose point along accel)
-            aim_point = agent.me.location + self._target_nose_dir * 1000
-            up_ref = Vector(0, 0, 1)
-            cubic_aim_at(agent, aim_point, up=up_ref)
-        else:
-            # Fallback to cubic aim during jump phase
-            aim_point = agent.me.location + delta_x
-            up_ref = Vector(0, 0, 1)
-            cubic_aim_at(agent, aim_point, up=up_ref)
-        
-        # Boost / throttle from optimal plan
+
+        # Cubic aim style: aim at car.location + offset (the velocity correction
+        # vector) instead of the target itself.  This makes the nose follow the
+        # required acceleration direction, producing a smooth near-straight path
+        # instead of constantly turning toward the ball.
+        aim_point = agent.me.location + delta_x
+
+        # Keep a stable world-up reference throughout the aerial. Using the
+        # ball direction here previously fought with `aim_point`, which
+        # already points roughly at the ball — asking the car to align both
+        # its forward AND up axes with the same direction is impossible and
+        # left the roll target unstable right when precision mattered most.
+        up_ref = Vector(0, 0, 1)
+
+        cubic_aim_at(agent, aim_point, up=up_ref)
+
+        # Boost / throttle: boost when the offset is large and we're facing it.
         required_speed = delta_x.dot(agent.me.forward) / T if T > 0 else 0
-        
-        if use_boost and agent.me.boost > 0 and required_speed >= (self.boost_accel + self.throttle_accel) / 30.0:
+        if agent.me.boost > 0 and required_speed >= (self.boost_accel + self.throttle_accel) * self.min_boost_time and delta_x.angle(agent.me.forward) < 0.4:
             agent.controller_state.boost = True
-            required_speed -= self.boost_accel / 30.0
-        else:
-            agent.controller_state.boost = False
-        
+            required_speed -= self.boost_accel * self.min_boost_time
+
         if T > 0:
-            agent.controller_state.throttle = clamp(required_speed / (self.throttle_accel / 30.0), -1, 1)
-        
-        # Final approach: flip into ball with nose
-        if not agent.me.doublejumped and T < 0.15:
-            # Compute desired hit direction (from ball to shot target)
-            hit_dir = (self.shot_target - self.ball_location).normalize()
-            
-            # Nose should point along hit_dir at impact
-            local_hit = agent.me.local(hit_dir).normalize()
-            
-            pitch_angle = math.atan2(local_hit.z, local_hit.x)
-            yaw_angle = math.atan2(local_hit.y, local_hit.x)
-            
-            # Strong correction to align nose
-            agent.controller_state.pitch = clamp(pitch_angle * 5.0, -1.0, 1.0)
-            agent.controller_state.yaw = clamp(yaw_angle * 5.0, -1.0, 1.0)
+            agent.controller_state.throttle = clamp(required_speed / (self.throttle_accel * self.min_boost_time), -1, 1)
+
+        if not agent.me.doublejumped and T < 0.1:
+            local_target = agent.me.local(target - agent.me.location).normalize()
+
+            # Use the same atan2-based angle-to-target convention as
+            # defaultPD/cubic_aim_at instead of a raw linear combination of
+            # local_target's components. The old formula (`-local_target.x +
+            # local_target.z * 0.5`) is dominated by `-local_target.x`, which
+            # sits near -1 whenever the nose is already roughly pointed at
+            # the target (the normal case, since aim_point has been tracking
+            # it all flight) — so it commanded a near-maximal nose-down flip
+            # on almost every aerial finish regardless of actual alignment,
+            # instead of a small corrective dodge. That uncontrolled flip is
+            # what let the car present its back to the ball instead of its
+            # nose depending on approach timing/direction.
+            pitch_angle = math.atan2(local_target.z, local_target.x)
+            yaw_angle = math.atan2(local_target.y, local_target.x)
+
+            agent.controller_state.pitch = clamp(pitch_angle * 3.0, -1.0, 1.0)
+            agent.controller_state.yaw = clamp(yaw_angle * 3.0, -1.0, 1.0)
             agent.controller_state.jump = True
-            
-            # Roll to keep wheels down
-            local_up = agent.me.local(Vector(0, 0, 1))
-            roll_angle = math.atan2(local_up.y, local_up.z)
-            agent.controller_state.roll = clamp(roll_angle * 3.0, -1.0, 1.0)
-        
+
         if T <= -0.4:
             agent.maneuver_lock = 0.0
 
