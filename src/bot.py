@@ -893,6 +893,13 @@ class AzureRL(Bot):
         for obj, idx in zip(self.opponents, opponent_indices):
             obj.update(packet, car_index=idx)
 
+        # Stable team roles prevent both bots from selecting the same shadow
+        # point. In 2v2 the highest player_id is the last-man defender; the
+        # other bot is the active challenger. Every instance derives this from
+        # the same packet, so there is no networked/shared state to desync.
+        team_ids = [p.player_id for p in packet.players if p.team == self.team]
+        self.deep_defender = len(team_ids) >= 2 and self.player_id == max(team_ids)
+
     def send_quickchat(self, key: str, message: str):
         last_time = self.last_quickchat_time.get(key, -999.0)
         if self.time - last_time < self.quickchat_cooldown:
@@ -990,22 +997,38 @@ class AzureRL(Bot):
         # 3. Offensive shot
         shot_opportunity = self.find_best_shot_opportunity()
 
-        if shot_opportunity and self.should_i_commit(shot_opportunity.get('ball_at_intercept', self.ball.location), shot_opportunity['intercept_time']):
-            self.execute_shot(shot_opportunity)
-            return
+        if shot_opportunity:
+            shot_ball = shot_opportunity.get('ball_at_intercept', self.ball.location)
+            # The deep defender does not chase ordinary offensive balls. This
+            # leaves one car behind the play while the other can challenge.
+            # Defensive shots/saves remain available to the deep defender.
+            defensive_commit = self.is_in_defensive_area(shot_ball) or self.is_towards_own_goal(
+                shot_ball, (shot_ball - self.me.location).normalize()
+            )
+            if (not self.deep_defender or defensive_commit) and self.should_i_commit(
+                    shot_ball, shot_opportunity['intercept_time'], is_save=shot_opportunity.get('urgent', False)):
+                self.execute_shot(shot_opportunity)
+                return
             
-        # 4. Boost collection — only when truly needed
-        BOOST_LOW_THRESHOLD = 30
-        BOOST_TARGET = 70
+        # 4. Boost collection — the last-man defender aggressively maintains
+        # a reserve so a sudden high save can be attacked with boost.
+        BOOST_LOW_THRESHOLD = 30 if not self.deep_defender else 55
+        BOOST_TARGET = 70 if not self.deep_defender else 95
         dist_to_ball = self.me.location.dist(self.ball.location)
         should_collect_boost = (self.me.boost < BOOST_LOW_THRESHOLD) or \
                               (self.me.boost < BOOST_TARGET and self.is_ball_safe() and dist_to_ball > 4000)
         
         if should_collect_boost:
             self.go_for_boost(packet)
-            return  
+            return
 
-        self.shadow_ball()
+        if self.deep_defender:
+            self.deep_defensive_anchor()
+        else:
+            self.shadow_ball()
+        return
+
+        # 4. Boost collection — only when truly needed
     
     def should_return_to_defense_emergency(self) -> bool:
         """Check if we should emergency return to defensive zone."""
@@ -1800,6 +1823,49 @@ class AzureRL(Bot):
             safe_pos = my_goal + (self.ball.location - my_goal).normalize() * 2000
             drive_to_target(self, safe_pos, target_speed=2300, boost=True)
             
+    def deep_defensive_anchor(self):
+        """Hold a deliberately deeper position than the active shadow bot.
+
+        The defender is the team's last man: it stays between the ball and
+        the goal, but substantially farther from the ball than the challenger.
+        This gives the team a predictable second layer for clears and aerial
+        saves instead of two cars converging on one shadow point.
+        """
+        self.mode = "Deep Defense"
+        my_goal = self.get_own_goal_pos()
+        ball = self.ball.location
+
+        ball_in_defensive_half = (self.team == 0 and ball.y < 0) or (self.team == 1 and ball.y > 0)
+        goal_to_ball = (ball - my_goal).normalize()
+
+        if ball_in_defensive_half:
+            # Stay behind the active shadow, with a larger separation when
+            # the ball is still far from goal.
+            ball_to_goal = (my_goal - ball).normalize()
+            anchor_dist = clamp(ball.dist(my_goal) * 0.55, 1900, 3000)
+            target = ball + ball_to_goal * anchor_dist
+        else:
+            # When the attack is upfield, protect the central lane rather than
+            # following the ball. This is also a good launch point for aerials.
+            target_y = my_goal.y - math.copysign(1900, my_goal.y)
+            target_x = clamp(ball.x * 0.30, -1800, 1800)
+            target = Vector(target_x, target_y, 0)
+
+        # Never park inside the goal and never drift onto the side wall.
+        if self.team == 0:
+            target.y = max(target.y, my_goal.y + 450)
+        else:
+            target.y = min(target.y, my_goal.y - 450)
+        target.x = clamp(target.x, -3000, 3000)
+        target.z = 0
+
+        # The defender deliberately carries speed/boost so it can leave the
+        # anchor quickly for a predicted save.
+        distance = self.me.location.dist(target)
+        speed = 1900 if ball_in_defensive_half else 1500
+        drive_to_target(self, target, target_speed=speed, boost=(self.me.boost < 70 and distance > 1200))
+        self.renderer_target = target
+
     def shadow_ball(self):
         self.mode = "Shadow"
         WALL_X_LIMIT = 3700  # Stay within field bounds
