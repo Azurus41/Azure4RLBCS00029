@@ -1,6 +1,6 @@
 [settings]
 agent_id = "azure00028-Github"
-name = "[RLB] Azure 00029 for Github"
+name = "[RLB] Azure 00028 for Github"
 loadout_file = "loadout.toml"
 run_command = "python bot.py" 
 run_command_linux = "python3 bot.py"
